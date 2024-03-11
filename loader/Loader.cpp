@@ -339,7 +339,68 @@ static int getSymNameByIdx(ifstream& elfFile, int index, string& name) {
     return getSymName(elfFile, symtab[index].st_name, name);
 }
 
+
 static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds) {
+
+static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
+                                   const struct bpf_map_def& mapDef, const enum bpf_map_type type) {
+    // bpfGetFd... family of functions require at minimum a 4.14 kernel,
+    // so on 4.9-T kernels just pretend the map matches our expectations.
+    // Additionally we'll get almost equivalent test coverage on newer devices/kernels.
+    // This is because the primary failure mode we're trying to detect here
+    // is either a source code misconfiguration (which is likely kernel independent)
+    // or a newly introduced kernel feature/bug (which is unlikely to get backported to 4.9).
+    if (!isAtLeastKernelVersion(4, 14, 0)) return true;
+
+    // Assuming fd is a valid Bpf Map file descriptor then
+    // all the following should always succeed on a 4.14+ kernel.
+    // If they somehow do fail, they'll return -1 (and set errno),
+    // which should then cause (among others) a key_size mismatch.
+    int fd_type = bpfGetFdMapType(fd);
+    int fd_key_size = bpfGetFdKeySize(fd);
+    int fd_value_size = bpfGetFdValueSize(fd);
+    int fd_max_entries = bpfGetFdMaxEntries(fd);
+    int fd_map_flags = bpfGetFdMapFlags(fd);
+
+    // DEVMAPs are readonly from the bpf program side's point of view, as such
+    // the kernel in kernel/bpf/devmap.c dev_map_init_map() will set the flag
+    int desired_map_flags = (int)mapDef.map_flags;
+    if (type == BPF_MAP_TYPE_DEVMAP || type == BPF_MAP_TYPE_DEVMAP_HASH)
+        desired_map_flags |= BPF_F_RDONLY_PROG;
+
+    // The .h file enforces that this is a power of two, and page size will
+    // also always be a power of two, so this logic is actually enough to
+    // force it to be a multiple of the page size, as required by the kernel.
+    unsigned int desired_max_entries = mapDef.max_entries;
+    if (type == BPF_MAP_TYPE_RINGBUF) {
+        if (desired_max_entries < page_size) desired_max_entries = page_size;
+    }
+
+    // The following checks should *never* trigger, if one of them somehow does,
+    // it probably means a bpf .o file has been changed/replaced at runtime
+    // and bpfloader was manually rerun (normally it should only run *once*
+    // early during the boot process).
+    // Another possibility is that something is misconfigured in the code:
+    // most likely a shared map is declared twice differently.
+    // But such a change should never be checked into the source tree...
+    if ((fd_type == type) &&
+        (fd_key_size == (int)mapDef.key_size) &&
+        (fd_value_size == (int)mapDef.value_size) &&
+        (fd_max_entries == (int)desired_max_entries) &&
+        (fd_map_flags == desired_map_flags)) {
+        return true;
+    }
+
+    ALOGE("bpf map name %s mismatch: desired/found: "
+          "type:%d/%d key:%u/%d value:%u/%d entries:%u/%d flags:%u/%d",
+          mapName.c_str(), type, fd_type, mapDef.key_size, fd_key_size, mapDef.value_size,
+          fd_value_size, mapDef.max_entries, fd_max_entries, desired_map_flags, fd_map_flags);
+    return false;
+}
+
+static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds,
+                      const char* prefix) {
+
     int ret;
     vector<struct bpf_map_def> md;
     vector<string> mapNames;
@@ -370,6 +431,30 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             mapFds.push_back(unique_fd());
             continue;
         }
+
+
+       enum bpf_map_type type = md[i].type;
+        if (type == BPF_MAP_TYPE_DEVMAP && !isAtLeastKernelVersion(4, 14, 0)) {
+            // On Linux Kernels older than 4.14 this map type doesn't exist, but it can kind
+            // of be approximated: ARRAY has the same userspace api, though it is not usable
+            // by the same ebpf programs.  However, that's okay because the bpf_redirect_map()
+            // helper doesn't exist on 4.9-T anyway (so the bpf program would fail to load,
+            // and thus needs to be tagged as 4.14+ either way), so there's nothing useful you
+            // could do with a DEVMAP anyway (that isn't already provided by an ARRAY)...
+            // Hence using an ARRAY instead of a DEVMAP simply makes life easier for userspace.
+            type = BPF_MAP_TYPE_ARRAY;
+        }
+        if (type == BPF_MAP_TYPE_DEVMAP_HASH && !isAtLeastKernelVersion(5, 4, 0)) {
+            // On Linux Kernels older than 5.4 this map type doesn't exist, but it can kind
+            // of be approximated: HASH has the same userspace visible api.
+            // However it cannot be used by ebpf programs in the same way.
+            // Since bpf_redirect_map() only requires 4.14, a program using a DEVMAP_HASH map
+            // would fail to load (due to trying to redirect to a HASH instead of DEVMAP_HASH).
+            // One must thus tag any BPF_MAP_TYPE_DEVMAP_HASH + bpf_redirect_map() using
+            // programs as being 5.4+...
+            type = BPF_MAP_TYPE_HASH;
+        }
+
 
         // The .h file enforces that this is a power of two, and page size will
         // also always be a power of two, so this logic is actually enough to
